@@ -1,0 +1,1298 @@
+from time import sleep
+from unittest.mock import patch
+from urllib.parse import quote_plus
+
+from channels.testing import ChannelsLiveServerTestCase
+from django.conf import settings
+from django.contrib.auth import get_permission_codename
+from django.contrib.auth.models import Permission
+from django.contrib.gis.geos import Point
+from django.contrib.staticfiles.testing import StaticLiveServerTestCase
+from django.test import override_settings, tag
+from django.urls import reverse
+from reversion.models import Version
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from swapper import load_model
+
+from openwisp_controller.connection.tests.utils import CreateConnectionsMixin
+from openwisp_controller.geo.tests.utils import TestGeoMixin
+from openwisp_monitoring.device.tests import (
+    TestDeviceMonitoringMixin,
+    TestWifiClientSessionMixin,
+)
+from openwisp_monitoring.monitoring.configuration import DEFAULT_DASHBOARD_TRAFFIC_CHART
+from openwisp_monitoring.monitoring.migrations import create_general_metrics
+from openwisp_utils.admin_theme.dashboard import DASHBOARD_TEMPLATES
+from openwisp_utils.tests import SeleniumTestMixin as BaseSeleniumTestMixin
+
+from ..device import settings as device_app_settings
+
+Device = load_model("config", "Device")
+DeviceConnection = load_model("connection", "DeviceConnection")
+DeviceData = load_model("device_monitoring", "DeviceData")
+AlertSettings = load_model("monitoring", "AlertSettings")
+Metric = load_model("monitoring", "Metric")
+Chart = load_model("monitoring", "Chart")
+Check = load_model("check", "Check")
+Location = load_model("geo", "Location")
+DeviceLocation = load_model("geo", "DeviceLocation")
+Floorplan = load_model("geo", "Floorplan")
+Group = load_model("openwisp_users", "Group")
+
+
+class SeleniumTestMixin(BaseSeleniumTestMixin):
+
+    @classmethod
+    def setUpClass(cls):
+        """
+        Sets up the necessary configurations for the test environment, ensuring
+        that the dashboard templates render correctly during Selenium tests.
+
+        During testing, the `OPENWISP_MONITORING_API_BASEURL` is set to
+        `http://testserver`, a dummy value for the test environment. The dashboard
+        templates are registered in the `AppConfig.ready` method, and these
+        templates depend on specific URLs being correctly configured.
+
+        Since mocking the `OPENWISP_MONITORING_API_BASEURL` does not update the
+        URLs in the already registered dashboard templates, this method manually
+        adjusts the template contexts to ensure they contain the correct URLs.
+        """
+        cls._dashboard_map_context = DASHBOARD_TEMPLATES[0][1].copy()
+        cls._dashboard_timeseries_context = DASHBOARD_TEMPLATES[55][1].copy()
+        DASHBOARD_TEMPLATES[0][1] = {
+            "monitoring_labels": {
+                "ok": device_app_settings.HEALTH_STATUS_LABELS["ok"],
+                "problem": device_app_settings.HEALTH_STATUS_LABELS["problem"],
+                "critical": device_app_settings.HEALTH_STATUS_LABELS["critical"],
+                "unknown": device_app_settings.HEALTH_STATUS_LABELS["unknown"],
+                "deactivated": device_app_settings.HEALTH_STATUS_LABELS["deactivated"],
+            }
+        }
+        DASHBOARD_TEMPLATES[55][1]["api_url"] = reverse(
+            "monitoring_general:api_dashboard_timeseries"
+        )
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        super().tearDownClass()
+        DASHBOARD_TEMPLATES[0][1] = cls._dashboard_map_context
+        DASHBOARD_TEMPLATES[55][1] = cls._dashboard_timeseries_context
+
+    def login(self, username=None, password=None, driver=None):
+        super().login(username, password, driver)
+        # Workaround for JS logic in chart-utils.js
+        # which fails to perform a XHR request
+        # during automated tests, it seems that the
+        # lack of pause causes the request to fail randomly
+        sleep(0.5)
+
+
+@tag("selenium_tests")
+class TestDeviceConnectionInlineAdmin(
+    SeleniumTestMixin,
+    TestDeviceMonitoringMixin,
+    CreateConnectionsMixin,
+    StaticLiveServerTestCase,
+):
+    config_app_label = "config"
+
+    def test_restoring_deleted_device(self):
+        org = self._get_org()
+        self._create_credentials(auto_add=True, organization=org)
+        device = self._create_config(organization=org).device
+        device_data = DeviceData.objects.get(id=device.id)
+        device_checks = device_data.checks.all()
+        for check in device_checks:
+            check.perform_check()
+        device_metric_ids = device_data.metrics.values_list("id", flat=True)
+        device_chart_ids = Chart.objects.filter(
+            metric_id__in=device_metric_ids
+        ).values_list("id", flat=True)
+        device_alert_setting_ids = AlertSettings.objects.filter(
+            metric_id__in=device_metric_ids
+        ).values_list("id", flat=True)
+        self.assertEqual(len(device_alert_setting_ids), 3)
+        self.assertEqual(len(device_metric_ids), 3)
+        self.assertEqual(len(device_checks), 4)
+        self.assertEqual(len(device_chart_ids), 3)
+
+        self.login()
+
+        # Save device to create revision.
+        self.open(
+            reverse(f"admin:{self.config_app_label}_device_change", args=[device.id])
+        )
+        self.hide_loading_overlay()
+        self.wait_for(
+            "element_to_be_clickable",
+            By.XPATH,
+            '//*[@id="device_form"]/div/div[1]/input[1]',
+        ).click()
+        try:
+            WebDriverWait(self.web_driver, 5).until(
+                EC.url_to_be(f"{self.live_server_url}/admin/config/device/")
+            )
+        except TimeoutException:
+            self.fail("Failed saving device")
+        # Delete the device
+        device.deactivate()
+        device.config.set_status_deactivated()
+        self.open(
+            reverse(f"admin:{self.config_app_label}_device_delete", args=[device.id])
+        )
+        self.find_element(
+            By.CSS_SELECTOR, '#content form input[type="submit"]', timeout=5
+        ).click()
+        self.assertEqual(Device.objects.count(), 0)
+        self.assertEqual(DeviceConnection.objects.count(), 0)
+        self.assertEqual(Check.objects.count(), 0)
+        self.assertEqual(Metric.objects.exclude(object_id=None).count(), 0)
+
+        version_obj = Version.objects.get_deleted(model=Device).first()
+
+        # Restore deleted device
+        self.open(
+            reverse(
+                f"admin:{self.config_app_label}_device_recover", args=[version_obj.id]
+            )
+        )
+        self.find_element(
+            By.XPATH, '//*[@id="device_form"]/div/div[1]/input[1]'
+        ).click()
+        try:
+            WebDriverWait(self.web_driver, 5).until(
+                EC.url_to_be(f"{self.live_server_url}/admin/config/device/")
+            )
+        except TimeoutException:
+            self.fail("Deleted device was not restored")
+
+        self.assertEqual(Device.objects.count(), 1)
+        self.assertEqual(DeviceConnection.objects.count(), 1)
+        # Ensure that existing Metric, AlertSetting and Chart objects
+        # was restored
+        self.assertEqual(Metric.objects.filter(id__in=device_metric_ids).count(), 3)
+        self.assertEqual(
+            AlertSettings.objects.filter(id__in=device_alert_setting_ids).count(), 3
+        )
+        self.assertEqual(Chart.objects.filter(id__in=device_chart_ids).count(), 3)
+
+
+@tag("selenium_tests")
+class TestDashboardCharts(
+    SeleniumTestMixin, TestDeviceMonitoringMixin, StaticLiveServerTestCase
+):
+    def setUp(self):
+        super().setUp()
+        # TransactionTestCase flushes the data, hence the metrics created
+        # with migrations are lost. Only create general metrics if required.
+        if Metric.objects.filter(object_id=None).count() != 2:
+            create_general_metrics(None, None)
+        self.assertEqual(Metric.objects.filter(object_id=None).count(), 2)
+
+    @patch.dict(DEFAULT_DASHBOARD_TRAFFIC_CHART, {"__all__": ["wlan0", "wlan1"]})
+    def test_dashboard_timeseries_charts(self):
+        self.login()
+        self.wait_for_visibility(
+            By.CSS_SELECTOR, "#ow-chart-inner-container", timeout=5
+        )
+        self.wait_for_visibility(By.CSS_SELECTOR, "#ow-chart-utils", timeout=5)
+        self.wait_for_visibility(By.CSS_SELECTOR, "#ow-chart-fallback", timeout=5)
+        self.assertIn(
+            "Insufficient data for selected time period.",
+            self.find_element(By.CSS_SELECTOR, "#ow-chart-fallback").get_attribute(
+                "innerHTML"
+            ),
+        )
+        self.create_test_data()
+        self.web_driver.refresh()
+        self.wait_for_visibility(By.CSS_SELECTOR, "#ow-chart-contents", timeout=10)
+        self.wait_for_visibility(By.CSS_SELECTOR, "#chart-0", timeout=10)
+        self.wait_for_visibility(By.CSS_SELECTOR, "#chart-1", timeout=10)
+        self.assertIn(
+            "General WiFi Clients",
+            self.find_element(By.CSS_SELECTOR, "#chart-0 > h3").get_attribute(
+                "innerHTML"
+            ),
+        )
+        self.assertIn(
+            "General Traffic",
+            self.find_element(By.CSS_SELECTOR, "#chart-1 > h3").get_attribute(
+                "innerHTML"
+            ),
+        )
+        self.assertIn(
+            "Open WiFi session list",
+            self.find_element(
+                By.CSS_SELECTOR, "#chart-0-quick-link-container"
+            ).get_attribute("innerHTML"),
+        )
+
+
+@tag("selenium_tests")
+class TestWifiSessionInlineAdmin(
+    SeleniumTestMixin,
+    TestWifiClientSessionMixin,
+    StaticLiveServerTestCase,
+):
+    config_app_label = "config"
+
+    def test_device_wifi_session_inline_change(self):
+        dm = self._create_device_monitoring()
+        device = dm.device
+        self.login()
+        path = f"admin:{self.config_app_label}_device_change"
+        self.open(reverse(path, args=[device.pk]))
+        self.hide_loading_overlay()
+        # Make sure the wifi session inline doesn't exist
+        self.wait_for_invisibility(By.CSS_SELECTOR, "#wifisession_set-group")
+        # We are still on the device change page,
+        # and now we will create new wifi sessions
+        ws1 = self._create_wifi_session(device=device)
+        wc2 = self._create_wifi_client(mac_address="22:33:44:55:66:88")
+        ws2 = self._create_wifi_session(
+            device=device, wifi_client=wc2, ssid="Test Wifi Session"
+        )
+        # Now press the 'Save' button on the device change page
+        self.find_element(
+            By.XPATH, '//*[@id="device_form"]/div/div[1]/input[3]'
+        ).click()
+        # Make sure the wifi session tab now
+        # exists with the correct wifi sessions
+        self.hide_loading_overlay()
+        self.wait_for(
+            "element_to_be_clickable", By.XPATH, '//*[@id="tabs-container"]/ul/li[7]/a'
+        ).click()
+        wifi_session_inline_form_error = (
+            "ManagementForm data is missing "
+            "or has been tampered with. Missing fields: "
+            "wifisession_set-TOTAL_FORMS, wifisession_set-INITIAL_FORMS."
+        )
+        # Make sure no inline formset errors
+        # were encountered after saving
+        self.assertNotIn(
+            wifi_session_inline_form_error,
+            self.find_element(By.CSS_SELECTOR, "#wifisession_set-group").get_attribute(
+                "innerHTML"
+            ),
+        )
+        # Make sure all wifi sessions are present
+        self.assertIn(
+            f"{ws1.ssid}",
+            self.find_element(By.CSS_SELECTOR, "#wifisession_set-group").get_attribute(
+                "innerHTML"
+            ),
+        )
+        self.assertIn(
+            f"{ws2.ssid}",
+            self.find_element(By.CSS_SELECTOR, "#wifisession_set-group").get_attribute(
+                "innerHTML"
+            ),
+        )
+        self.assertIn(
+            "View Full History of WiFi Sessions",
+            self.find_element(By.CSS_SELECTOR, "#wifisession_set-group").get_attribute(
+                "innerHTML"
+            ),
+        )
+
+
+@tag("selenium_tests")
+@override_settings(
+    CHANNEL_LAYERS={
+        "default": {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {
+                "hosts": [f"redis://{getattr(settings, 'REDIS_HOST', 'localhost')}/7"]
+            },
+        }
+    },
+)
+class TestDashboardMap(
+    SeleniumTestMixin,
+    TestDeviceMonitoringMixin,
+    TestGeoMixin,
+    ChannelsLiveServerTestCase,
+):
+    object_model = Device
+    location_model = Location
+    floorplan_model = Floorplan
+    object_location_model = DeviceLocation
+    config_app_label = "config"
+
+    def _open_popup(self, mapType, id):
+        self.web_driver.execute_script(
+            "return window[arguments[0]].utils.openPopup(arguments[1]);",
+            mapType,
+            str(id),
+        )
+
+    def test_features_on_device_popup(self):
+        org = self._get_org()
+        d1 = self._create_device(
+            name="Test-Device1", mac_address="00:00:00:00:00:01", organization=org
+        )
+        d2 = self._create_device(
+            name="Test-Device2", mac_address="00:00:00:00:00:02", organization=org
+        )
+        d2.monitoring.status = "ok"
+        d2.monitoring.save()
+        location = self._create_location(
+            type="outdoor", name="Test-Location", organization=org
+        )
+        self._create_object_location(
+            content_object=d1,
+            location=location,
+            organization=org,
+        )
+        self._create_object_location(
+            content_object=d2,
+            location=location,
+            organization=org,
+        )
+        self.login()
+        self.wait_for_visibility(By.CSS_SELECTOR, ".leaflet-container", timeout=5)
+        self._open_popup("_owGeoMap", location.id)
+        self.wait_for_visibility(By.CSS_SELECTOR, ".map-detail", timeout=5)
+        table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+        self.assertEqual(len(table_entries), 2)
+
+        with self.subTest("Test filtering by status for status ok"):
+            status_ok = self.find_element(By.CSS_SELECTOR, ".map-detail .health-ok")
+            status_ok_close_btn = self.find_element(
+                By.CSS_SELECTOR, ".health-ok .remove-icon", wait_for="presence"
+            )
+            self.assertFalse(status_ok_close_btn.is_displayed())
+            status_ok.click()
+            self.assertTrue(status_ok_close_btn.is_displayed())
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .ow-loading-spinner"
+            )
+            table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+            self.assertEqual(len(table_entries), 1)
+            self.assertIn(d2.name, table_entries[0].text)
+
+        with self.subTest("Test filtering by status for status ok and unknown"):
+            status_unknown = self.find_element(
+                By.CSS_SELECTOR, ".map-detail .health-unknown"
+            )
+            status_unknown_close_btn = self.find_element(
+                By.CSS_SELECTOR, ".health-unknown .remove-icon", wait_for="presence"
+            )
+            self.assertFalse(status_unknown_close_btn.is_displayed())
+            status_unknown.click()
+            self.assertTrue(status_unknown_close_btn.is_displayed())
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .ow-loading-spinner"
+            )
+            table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+            self.assertEqual(len(table_entries), 2)
+
+        with self.subTest("Test removing filters by clicking close button"):
+            status_ok_close_btn.click()
+            self.assertFalse(status_ok_close_btn.is_displayed())
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .ow-loading-spinner", timeout=5
+            )
+            table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+            self.assertEqual(len(table_entries), 1)
+            self.assertIn(d1.name, table_entries[0].text)
+            status_unknown.click()
+            self.assertFalse(status_unknown_close_btn.is_displayed())
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .ow-loading-spinner"
+            )
+            table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+            self.assertEqual(len(table_entries), 2)
+
+        with self.subTest("Test search field"):
+            input_field = self.find_element(By.CSS_SELECTOR, "#device-search")
+            input_field.send_keys("device1")
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .ow-loading-spinner"
+            )
+            table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+            self.assertEqual(len(table_entries), 1)
+            self.assertIn(d1.name, table_entries[0].text)
+
+        with self.subTest("Test clearing input field"):
+            input_field.clear()
+            # Just clearing the input field does not trigger the event listeners
+            input_field.send_keys(" ")
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .ow-loading-spinner"
+            )
+            table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+            self.assertEqual(len(table_entries), 2)
+
+        with self.subTest("Test filtering to get no results"):
+            input_field.send_keys("Non-Existent-Device")
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .ow-loading-spinner"
+            )
+            table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+            self.assertEqual(len(table_entries), 1)
+            self.assertIn("No devices found", table_entries[0].text)
+
+        with self.subTest("Verify show floor button is not present"):
+            button_displayed = self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".map-detail .floorplan-btn"
+            )
+            self.assertTrue(button_displayed)
+
+    def test_infinite_scroll_on_popup(self):
+        location = self._create_location(type="indoor", name="Test-Location")
+        for i in range(20):
+            device = self._create_device(
+                name=f"Test-Device-{i + 1}",
+                mac_address=f"00:00:00:00:00:{i + 1:02d}",
+                organization=location.organization,
+            )
+            self._create_object_location(
+                content_object=device,
+                location=location,
+            )
+        self.login()
+        self.wait_for_visibility(By.CSS_SELECTOR, ".leaflet-container")
+        self._open_popup("_owGeoMap", location.id)
+        self.wait_for_visibility(By.CSS_SELECTOR, ".map-detail", timeout=5)
+        table_container = self.find_element(
+            By.CSS_SELECTOR, ".map-detail .table-container"
+        )
+        table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+        self.assertEqual(len(table_entries), 10)
+        self.web_driver.execute_script(
+            "arguments[0].scrollTop = arguments[0].scrollHeight", table_container
+        )
+        self.wait_for_invisibility(By.CSS_SELECTOR, ".map-detail .ow-loading-spinner")
+        table_entries = self.find_elements(By.CSS_SELECTOR, ".map-detail tbody tr")
+        self.assertEqual(len(table_entries), 20)
+
+    def test_url_fragment_actions_on_geo_map(self):
+        device_location = self._create_object_location()
+        device = device_location.device
+        location = device_location.location
+        self.login()
+        mapId = "dashboard-geo-map"
+
+        with self.subTest("Test setting url fragments on click event of node"):
+            self._open_popup("_owGeoMap", location.id)
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"nodeId={location.id}"
+                    in d.execute_script("return window.location.hash;")
+                )
+            except TimeoutException:
+                self.fail("URL fragment was not updated after opening geo map popup")
+            current_hash = self.web_driver.execute_script(
+                "return window.location.hash;"
+            )
+            expected_hash = f"id={mapId}&nodeId={location.id}"
+            self.assertIn(expected_hash, current_hash)
+
+        with self.subTest("Test applying url fragment state on map"):
+            current_url = self.web_driver.current_url
+            self.web_driver.switch_to.new_window("tab")
+            tabs = self.web_driver.window_handles
+            self.web_driver.switch_to.window(tabs[1])
+            self.web_driver.get(current_url)
+            popup = self.find_element(By.CSS_SELECTOR, ".map-detail", timeout=5)
+            device_link = self.find_element(
+                By.XPATH, f".//td[@class='col-name']/a[text()='{device.name}']"
+            )
+            self.assertTrue(popup.is_displayed())
+            self.assertTrue(device_link.is_displayed())
+            self.web_driver.close()
+            self.web_driver.switch_to.window(tabs[0])
+
+        with self.subTest("Test with incorrect node Id"):
+            incorrect_url = (
+                f"{self.live_server_url}/admin/#id={mapId}&nodeId=incorrectId"
+            )
+            self.web_driver.switch_to.new_window("tab")
+            tabs = self.web_driver.window_handles
+            self.web_driver.switch_to.window(tabs[1])
+            self.web_driver.get(incorrect_url)
+            self.wait_for_invisibility(By.CSS_SELECTOR, ".map-detail", timeout=5)
+            self.web_driver.close()
+            self.web_driver.switch_to.window(tabs[0])
+
+    def test_floorplan_overlay(self):
+        org = self._get_org()
+        location = self._create_location(type="indoor", organization=org)
+        floor1 = self._create_floorplan(floor=1, location=location)
+        floor2 = self._create_floorplan(floor=2, location=location)
+        device1 = self._create_device(
+            name="Test-Device1", mac_address="00:00:00:00:00:01", organization=org
+        )
+        device2 = self._create_device(
+            name="Test-Device2", mac_address="00:00:00:00:00:02", organization=org
+        )
+        self._create_object_location(
+            content_object=device1,
+            location=location,
+            floorplan=floor1,
+            organization=org,
+        )
+        self._create_object_location(
+            content_object=device2,
+            location=location,
+            floorplan=floor2,
+            organization=org,
+        )
+        self.login()
+        self.wait_for_visibility(By.CSS_SELECTOR, "#device-map-container")
+        self.wait_for_visibility(By.CSS_SELECTOR, ".leaflet-container")
+        self._open_popup("_owGeoMap", location.id)
+
+        with self.subTest("Test floorplan rendering"):
+            self.wait_for(
+                "element_to_be_clickable",
+                By.CSS_SELECTOR,
+                ".map-detail .floorplan-btn",
+                timeout=5,
+            ).click()
+            canvases = self.find_elements(
+                By.CSS_SELECTOR, "#floor-content-1 canvas", timeout=5
+            )
+            self.assertGreater(len(canvases), 0)
+
+        with self.subTest("Test floorplan navigation"):
+            right_arrow = self.find_element(
+                By.CSS_SELECTOR, "#floorplan-navigation .right-arrow", timeout=5
+            )
+            right_arrow.click()
+            floor_heading = self.find_element(By.CSS_SELECTOR, "#floorplan-title")
+            self.assertIn("2nd floor", floor_heading.text.lower())
+            canvases = self.find_elements(
+                By.CSS_SELECTOR, "#floor-content-2 canvas", timeout=5
+            )
+            self.assertGreater(len(canvases), 0)
+
+            left_arrow = self.find_element(
+                By.CSS_SELECTOR, "#floorplan-navigation .left-arrow", timeout=5
+            )
+            left_arrow.click()
+            floor_heading = self.find_element(By.CSS_SELECTOR, "#floorplan-title")
+            self.assertIn("1st floor", floor_heading.text.lower())
+            canvases = self.find_elements(
+                By.CSS_SELECTOR, "#floor-content-1 canvas", timeout=5
+            )
+            self.assertGreater(len(canvases), 0)
+
+            second_floor_btn = self.find_element(
+                By.CSS_SELECTOR, "#floorplan-navigation .floor-btn[data-floor='2']"
+            )
+            second_floor_btn.click()
+            floor_heading = self.find_element(By.CSS_SELECTOR, "#floorplan-title")
+            self.assertIn("2nd floor", floor_heading.text.lower())
+            canvases = self.find_elements(
+                By.CSS_SELECTOR, "#floor-content-2 canvas", timeout=5
+            )
+            self.assertGreater(len(canvases), 0)
+
+        with self.subTest("Test redirecting to device page from indoor map"):
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: d.execute_script("return window._owIndoorMap != null")
+                )
+            except TimeoutException:
+                self.fail("Indoor map was not initialized")
+            self._open_popup("_owIndoorMap", device2.id)
+            open_device_btn = self.find_element(
+                By.CSS_SELECTOR,
+                ".open-device-btn-container .open-device-btn",
+                timeout=5,
+            )
+            open_device_btn.click()
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    EC.url_to_be(
+                        f"{self.live_server_url}/admin/config/device/{device2.id}/change/"
+                    )
+                )
+            except TimeoutException:
+                self.fail("Failed to redirect to device change page")
+            self.assertIn(
+                f"/config/device/{device2.id}/change/", self.web_driver.current_url
+            )
+
+    def test_switching_floorplan_in_fullscreen_mode(self):
+        org = self._get_org()
+        location = self._create_location(type="indoor", organization=org)
+        floor1 = self._create_floorplan(floor=1, location=location)
+        floor2 = self._create_floorplan(floor=2, location=location)
+        device1 = self._create_device(
+            name="Test-Device1", mac_address="00:00:00:00:00:01", organization=org
+        )
+        device2 = self._create_device(
+            name="Test-Device2", mac_address="00:00:00:00:00:02", organization=org
+        )
+        self._create_object_location(
+            content_object=device1,
+            location=location,
+            floorplan=floor1,
+            organization=org,
+        )
+        self._create_object_location(
+            content_object=device2,
+            location=location,
+            floorplan=floor2,
+            organization=org,
+        )
+        self.login()
+        self.wait_for_visibility(By.CSS_SELECTOR, "#device-map-container")
+        self.wait_for_visibility(By.CSS_SELECTOR, ".leaflet-container")
+        self._open_popup("_owGeoMap", location.id)
+        self.wait_for(
+            "element_to_be_clickable", By.CSS_SELECTOR, ".map-detail .floorplan-btn"
+        ).click()
+        canvases = self.find_elements(
+            By.CSS_SELECTOR, "#floor-content-1 canvas", timeout=5
+        )
+        self.assertGreater(len(canvases), 0)
+        self.wait_for(
+            "element_to_be_clickable",
+            By.CSS_SELECTOR,
+            "#floor-content-1 .leaflet-control-fullscreen-button",
+            timeout=5,
+        ).click()
+        container = self.find_element(
+            By.CSS_SELECTOR, "#floor-content-1 .leaflet-container"
+        )
+        self.assertIn("leaflet-fullscreen-on", container.get_attribute("class"))
+        self.wait_for(
+            "element_to_be_clickable",
+            By.CSS_SELECTOR,
+            "#floorplan-navigation .right-arrow",
+            timeout=5,
+        ).click()
+        container = self.find_element(
+            By.CSS_SELECTOR, "#floor-content-1 .leaflet-container", wait_for="presence"
+        )
+        self.assertNotIn("leaflet-fullscreen-on", container.get_attribute("class"))
+        floor_heading = self.find_element(By.CSS_SELECTOR, "#floorplan-title")
+        self.assertIn("2nd floor", floor_heading.text.lower())
+        canvases = self.find_elements(
+            By.CSS_SELECTOR, "#floor-content-2 canvas", timeout=5
+        )
+        self.assertGreater(len(canvases), 0)
+
+    def test_url_fragment_actions_on_indoor_map(self):
+        org = self._get_org()
+        device = self._create_device(organization=org)
+        location = self._create_location(type="indoor", organization=org)
+        floorplan = self._create_floorplan(floor=1, location=location)
+        device_location = self._create_object_location(
+            content_object=device,
+            location=location,
+            floorplan=floorplan,
+            organization=org,
+        )
+        self.login()
+        self._open_popup("_owGeoMap", location.id)
+        self.wait_for(
+            "element_to_be_clickable",
+            By.CSS_SELECTOR,
+            ".map-detail .floorplan-btn",
+            timeout=5,
+        ).click()
+        canvases = self.find_elements(
+            By.CSS_SELECTOR, "#floor-content-1 canvas", timeout=5
+        )
+        try:
+            WebDriverWait(self.web_driver, 5).until(
+                lambda d: d.execute_script("return window._owIndoorMap != null")
+            )
+        except TimeoutException:
+            self.fail("Indoor map was not initialized")
+        self.assertGreater(len(canvases), 0)
+        mapId = "dashboard-geo-map"
+        indoorMapId = f"{location.id}_{floorplan.floor}"
+
+        with self.subTest("Test setting url fragments on click event of node"):
+            self._open_popup("_owIndoorMap", device.id)
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"id={quote_plus(indoorMapId)}&nodeId={device_location.id}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment was not updated after opening indoor map node popup"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};"
+                f"id={quote_plus(indoorMapId)}&nodeId={device_location.id}"
+            )
+            self.assertIn(expected_hash, current_hash)
+
+        with self.subTest("Test applying url fragment state on indoor map"):
+            current_url = self.web_driver.current_url
+            self.web_driver.switch_to.new_window("tab")
+            tabs = self.web_driver.window_handles
+            self.web_driver.switch_to.window(tabs[1])
+            self.web_driver.get(current_url)
+            popup = self.wait_for_visibility(
+                By.CSS_SELECTOR, ".njg-tooltip-inner", timeout=5
+            )
+            self.assertTrue(popup.is_displayed())
+            self.assertIn(device.name, popup.get_attribute("innerHTML"))
+            self.web_driver.close()
+            self.web_driver.switch_to.window(tabs[0])
+
+        with self.subTest("Test with incorrect node Id"):
+            incorrect_url = (
+                f"{self.live_server_url}/admin/#id={indoorMapId}&nodeId=incorrectId"
+            )
+            self.web_driver.switch_to.new_window("tab")
+            tabs = self.web_driver.window_handles
+            self.web_driver.switch_to.window(tabs[1])
+            self.web_driver.get(incorrect_url)
+            popup_not_displayed = self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".njg-tooltip-inner"
+            )
+            self.assertTrue(popup_not_displayed)
+            self.web_driver.close()
+            self.web_driver.switch_to.window(tabs[0])
+
+        # Cleanup in case of failure to ensure the it does not end up with multiple tabs open
+        if len(self.web_driver.window_handles) > 1:
+            primary_tab = self.web_driver.window_handles[0]
+            for tab in self.web_driver.window_handles[1:]:
+                self.web_driver.switch_to.window(tab)
+                self.web_driver.close()
+            self.web_driver.switch_to.window(primary_tab)
+
+    def test_dashboard_map_without_permissions(self):
+        org = self._get_org()
+        user = self._create_user(
+            username="testuser",
+            password="password",
+            is_staff=True,
+            is_superuser=False,
+            email="user1@email.com",
+        )
+        self._create_org_user(user=user, organization=org, is_admin=True)
+        permissions = Permission.objects.filter(codename__endswith="location")
+        user.user_permissions.add(*permissions)
+        self.login(username="testuser", password="password")
+        no_data_div = self.find_element(By.CSS_SELECTOR, ".no-data")
+        self.assertTrue(no_data_div.is_displayed())
+        self.assertIn("No map data to show.", no_data_div.text)
+
+    def test_mobile_location_updates_on_dashboard_map(self):
+        org = self._get_org()
+        device = self._create_device(organization=org)
+        location = self._create_location(
+            is_mobile=True, name="Test-Location", organization=org
+        )
+        self._create_object_location(
+            content_object=device,
+            location=location,
+            organization=org,
+        )
+        self.login()
+        location.geometry = Point(12.513124, 41.898903)
+        location.full_clean()
+        location.save()
+        try:
+            series_value = WebDriverWait(self.web_driver, 5).until(
+                lambda d: d.execute_script("""
+                    const options = window._owGeoMap.echarts.getOption();
+                    const series = options.series.find(
+                        (s) => s.type === "scatter" || s.type === "effectScatter",
+                    );
+                    const item = series.data.find(d => d.name === "Test-Location");
+                    if (!item) return false;
+                    return item.value;
+                """)
+            )
+        except TimeoutException:
+            self.fail("Failed to retrieve mobile location data")
+        self.assertEqual([location.geometry.x, location.geometry.y], series_value)
+
+        with self.subTest("Test mobile location with open device list popup"):
+            self._open_popup("_owGeoMap", location.id)
+            self.wait_for_visibility(By.CSS_SELECTOR, ".map-detail", timeout=5)
+            location.geometry = Point(12.511124, 41.898903)
+            location.full_clean()
+            location.save()
+            try:
+                series_value = WebDriverWait(self.web_driver, 5).until(
+                    lambda d: d.execute_script("""
+                        const options = window._owGeoMap.echarts.getOption();
+                        const series = options.series.find(
+                            (s) => s.type === "scatter" || s.type === "effectScatter",
+                        );
+                        const item = series.data.find(d => d.name === "Test-Location");
+                        if (!item) return false;
+                        return item.value;
+                    """)
+                )
+            except TimeoutException:
+                self.fail("Failed to retrieve updated mobile location data")
+            self.assertEqual([location.geometry.x, location.geometry.y], series_value)
+
+    def test_mobile_location_updates_on_dashboard_map_with_org_isolation(self):
+        org1 = self._get_org(org_name="test1")
+        org2 = self._get_org(org_name="test2")
+        org1_location = self._create_location(
+            name="Org1-Location",
+            is_mobile=True,
+            organization=org1,
+            geometry="SRID=4326;POINT (12.513124 41.898903)",
+        )
+        org1_device = self._create_device(organization=org1)
+        self._create_object_location(
+            content_object=org1_device,
+            location=org1_location,
+            organization=org1,
+        )
+        org2_location = self._create_location(
+            name="Org2-Location",
+            is_mobile=True,
+            organization=org2,
+            geometry="SRID=4326;POINT (12.515124 41.898903)",
+        )
+        org2_device = self._create_device(organization=org2)
+        self._create_object_location(
+            content_object=org2_device,
+            location=org2_location,
+            organization=org2,
+        )
+        administrator = Group.objects.create(name="Administrator")
+        perm = Permission.objects.filter(
+            codename=get_permission_codename("change", self.location_model._meta),
+        ).first()
+        administrator.permissions.add(perm)
+
+        with self.subTest("Org1 and Org2 location update is broadcast to superuser"):
+            self.login()
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR, ".leaflet-container .ow-loading-spinner"
+            )
+            org1_location.geometry = Point(12.515124, 41.898903, srid=4326)
+            org1_location.full_clean()
+            org1_location.save()
+            org2_location.geometry = Point(12.515124, 41.899603, srid=4326)
+            org2_location.full_clean()
+            org2_location.save()
+            sleep(0.3)  # Wait for JS animation
+            try:
+                series_locations = WebDriverWait(self.web_driver, 5).until(
+                    lambda d: d.execute_script("""
+                        const options = window._owGeoMap.echarts.getOption();
+                        const series = options.series.find(
+                            (s) => s.type === "scatter" || s.type === "effectScatter",
+                        );
+                        const org1_location = series.data.find(l => l.name === "Org1-Location")
+                        const org2_location = series.data.find(l => l.name === "Org2-Location")
+                        if (!org1_location || !org2_location) return false;
+                        return {org1_location, org2_location}
+                    """)
+                )
+            except TimeoutException:
+                self.fail("Failed to retrieve org location data from superuser")
+            self.assertEqual(
+                [org1_location.geometry.x, org1_location.geometry.y],
+                series_locations["org1_location"]["value"],
+            )
+            self.assertEqual(
+                [org2_location.geometry.x, org2_location.geometry.y],
+                series_locations["org2_location"]["value"],
+            )
+
+        with self.subTest("Org1 location update is broadcast to org1 user only"):
+            self._create_administrator(
+                organizations=[org1],
+                username="user1",
+                password="password",
+                email="user1@test.org",
+            )
+            org1_driver = self.get_webdriver()
+            self.login(username="user1", password="password", driver=org1_driver)
+            org1_location.geometry = Point(12.517124, 41.898903, srid=4326)
+            org1_location.full_clean()
+            org1_location.save()
+            sleep(0.3)  # Wait for JS animation
+            try:
+                series_locations = WebDriverWait(org1_driver, 5).until(
+                    lambda d: d.execute_script("""
+                        const options = window._owGeoMap.echarts.getOption();
+                        const series = options.series.find(
+                            (s) => s.type === "scatter" || s.type === "effectScatter",
+                        );
+                        const org1_location = series.data.find(l => l.name === "Org1-Location")
+                        const org2_location = series.data.find(l => l.name === "Org2-Location")
+                        if (!org1_location) return false;
+                        if (org2_location !== undefined) return false;
+                        return {org1_location, org2_location}
+                    """)
+                )
+            except TimeoutException:
+                self.fail("Failed to retrieve org1 location data from org1 user")
+            finally:
+                org1_driver.quit()
+            self.assertEqual(
+                [org1_location.geometry.x, org1_location.geometry.y],
+                series_locations["org1_location"]["value"],
+            )
+            self.assertIsNone(series_locations["org2_location"])
+
+        with self.subTest("Org2 location update is broadcast to org2 user only"):
+            self._create_administrator(
+                organizations=[org2],
+                username="user2",
+                password="password",
+                email="user2@test.org",
+            )
+            org2_driver = self.get_webdriver()
+            self.login(username="user2", password="password", driver=org2_driver)
+            org2_location.geometry = Point(12.517124, 41.899603, srid=4326)
+            org2_location.full_clean()
+            org2_location.save()
+            sleep(0.3)  # Wait for JS animation
+            try:
+                series_locations = WebDriverWait(org2_driver, 5).until(
+                    lambda d: d.execute_script("""
+                        const options = window._owGeoMap.echarts.getOption();
+                        const series = options.series.find(
+                            (s) => s.type === "scatter" || s.type === "effectScatter",
+                        );
+                        const org1_location = series.data.find(l => l.name === "Org1-Location")
+                        const org2_location = series.data.find(l => l.name === "Org2-Location")
+                        if (org1_location !== undefined) return false;
+                        if (!org2_location) return false;
+                        return {org1_location, org2_location}
+                    """)
+                )
+            except TimeoutException:
+                self.fail("Failed to retrieve org2 location data from org2 user")
+            finally:
+                org2_driver.quit()
+            self.assertEqual(
+                [org2_location.geometry.x, org2_location.geometry.y],
+                series_locations["org2_location"]["value"],
+            )
+            self.assertIsNone(series_locations["org1_location"])
+
+    def test_opening_full_page_map_view_from_device_detail_page(self):
+        org = self._get_org()
+        device = self._create_device(organization=org)
+        location = self._create_location(type="indoor", organization=org)
+        floorplan = self._create_floorplan(floor=1, location=location)
+        device_location = self._create_object_location(
+            content_object=device,
+            location=location,
+            floorplan=floorplan,
+            organization=org,
+        )
+        self.login()
+        mapId = "dashboard-geo-map"
+        indoorMapId = f"{location.id}_{floorplan.floor}"
+
+        with self.subTest("Open geographic location on full map page"):
+            url = reverse(
+                f"admin:{self.config_app_label}_device_change", args=[device.id]
+            )
+            self.open(f"{url}#devicelocation-group")
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR,
+                "#loading-overlay",
+                timeout=5,
+            )
+            self.wait_for(
+                "element_to_be_clickable",
+                By.CSS_SELECTOR,
+                "#open-location-btn",
+                timeout=5,
+            ).click()
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"nodeId={location.id}"
+                    in d.execute_script("return window.location.hash;")
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment was not updated after opening location from device page"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return window.location.hash;"
+            )
+            expected_hash = f"id={mapId}&nodeId={location.id}"
+            self.assertIn(expected_hash, current_hash)
+            popup = self.find_element(By.CSS_SELECTOR, ".map-detail", timeout=5)
+            device_link = self.find_element(
+                By.XPATH, f".//td[@class='col-name']/a[text()='{device.name}']"
+            )
+            self.assertTrue(popup.is_displayed())
+            self.assertTrue(device_link.is_displayed())
+
+        with self.subTest("Open indoor location on full map page"):
+            url = reverse(
+                f"admin:{self.config_app_label}_device_change", args=[device.id]
+            )
+            self.open(f"{url}#devicelocation-group")
+            self.wait_for_invisibility(
+                By.CSS_SELECTOR,
+                "#loading-overlay",
+                timeout=5,
+            )
+            self.wait_for(
+                "element_to_be_clickable",
+                By.CSS_SELECTOR,
+                "#open-indoor-device-btn",
+                timeout=5,
+            ).click()
+            floorplan_overlay = self.wait_for_visibility(
+                By.CSS_SELECTOR, "#floorplan-overlay", timeout=5
+            )
+            popup = self.wait_for_visibility(
+                By.CSS_SELECTOR, ".njg-tooltip-inner", timeout=5
+            )
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"nodeId={device_location.id}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment was not updated after opening indoor device from device page"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};"
+                f"id={quote_plus(indoorMapId)}&nodeId={device_location.id}"
+            )
+            self.assertIn(expected_hash, current_hash)
+            self.assertTrue(floorplan_overlay.is_displayed())
+            self.assertTrue(popup.is_displayed())
+            self.assertIn(device.name, popup.get_attribute("innerHTML"))
+
+    def test_indoor_map_fragment_added_on_map_ready_without_node_click(self):
+        org = self._get_org()
+        location = self._create_location(type="indoor", organization=org)
+        floorplan1 = self._create_floorplan(floor=1, location=location)
+        floorplan2 = self._create_floorplan(floor=2, location=location)
+        device1 = self._create_device(
+            name="Test-Device1", mac_address="00:00:00:00:00:01", organization=org
+        )
+        device2 = self._create_device(
+            name="Test-Device2", mac_address="00:00:00:00:00:02", organization=org
+        )
+        device_location1 = self._create_object_location(
+            content_object=device1,
+            location=location,
+            floorplan=floorplan1,
+            organization=org,
+        )
+        device_location2 = self._create_object_location(
+            content_object=device2,
+            location=location,
+            floorplan=floorplan2,
+            organization=org,
+        )
+        self.login()
+        self._open_popup("_owGeoMap", location.id)
+        mapId = "dashboard-geo-map"
+        indoorMapId1 = f"{location.id}_{floorplan1.floor}"
+        indoorMapId2 = f"{location.id}_{floorplan2.floor}"
+
+        with self.subTest("Test URL fragment set when floorplan overlay is opened"):
+            self.wait_for(
+                "element_to_be_clickable",
+                By.CSS_SELECTOR,
+                ".map-detail .floorplan-btn",
+                timeout=5,
+            ).click()
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"id={quote_plus(indoorMapId1)}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment was not updated after opening floorplan overlay"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};" f"id={quote_plus(indoorMapId1)}"
+            )
+            self.assertIn(expected_hash, current_hash)
+
+        with self.subTest(
+            "Test nodeId param added on indoor map popup open and removed on close"
+        ):
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: d.execute_script("return window._owIndoorMap != null")
+                )
+            except TimeoutException:
+                self.fail("Indoor map was not initialized")
+            self._open_popup("_owIndoorMap", device1.id)
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"nodeId={device_location1.id}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment was not updated after opening indoor map node popup"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};"
+                f"id={quote_plus(indoorMapId1)}&nodeId={device_location1.id}"
+            )
+            self.assertIn(expected_hash, current_hash)
+            self.wait_for(
+                "element_to_be_clickable",
+                By.CSS_SELECTOR,
+                "#floorplan-container .leaflet-popup-close-button",
+                timeout=5,
+            ).click()
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"id={quote_plus(indoorMapId1)}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment nodeId was not removed after closing indoor map popup"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};" f"id={quote_plus(indoorMapId1)}"
+            )
+            self.assertIn(expected_hash, current_hash)
+
+        with self.subTest(
+            "Test URL fragment updates when switching floors on indoor map and device popup opened/closed"
+        ):
+            self.wait_for(
+                "element_to_be_clickable",
+                By.CSS_SELECTOR,
+                "#floorplan-navigation .right-arrow",
+                timeout=5,
+            ).click()
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"id={quote_plus(indoorMapId2)}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail("URL fragment was not updated after switching to floor 2")
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};" f"id={quote_plus(indoorMapId2)}"
+            )
+            self.assertIn(expected_hash, current_hash)
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: d.execute_script("return window._owIndoorMap != null")
+                )
+            except TimeoutException:
+                self.fail("Indoor map was not initialized after opening floorplan")
+            self._open_popup("_owIndoorMap", device2.id)
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"nodeId={device_location2.id}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment was not updated after opening device2 popup on floor 2"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};"
+                f"id={quote_plus(indoorMapId2)}&nodeId={device_location2.id}"
+            )
+            self.assertIn(expected_hash, current_hash)
+            self.wait_for(
+                "element_to_be_clickable",
+                By.CSS_SELECTOR,
+                "#floorplan-container .leaflet-popup-close-button",
+                timeout=5,
+            ).click()
+            try:
+                WebDriverWait(self.web_driver, 5).until(
+                    lambda d: f"id={quote_plus(indoorMapId2)}"
+                    in d.execute_script(
+                        "return decodeURIComponent(window.location.hash);"
+                    )
+                )
+            except TimeoutException:
+                self.fail(
+                    "URL fragment nodeId was not removed after closing device2 popup"
+                )
+            current_hash = self.web_driver.execute_script(
+                "return decodeURIComponent(window.location.hash);"
+            )
+            expected_hash = (
+                f"#id={mapId}&nodeId={location.id};" f"id={quote_plus(indoorMapId2)}"
+            )
+            self.assertIn(expected_hash, current_hash)
+
+        with self.subTest(
+            "Test URL fragment with only nodeId param: state applied on new tab, popup not shown"
+        ):
+            current_url = self.web_driver.current_url
+            self.web_driver.switch_to.new_window("tab")
+            tabs = self.web_driver.window_handles
+            self.web_driver.switch_to.window(tabs[1])
+            self.web_driver.get(current_url)
+            floor_heading = self.find_element(By.CSS_SELECTOR, "#floorplan-title")
+            self.assertIn("2nd floor", floor_heading.text.lower())
+            canvases = self.find_elements(
+                By.CSS_SELECTOR, "#floor-content-2 canvas", timeout=5
+            )
+            self.assertGreater(len(canvases), 0)
+            popup_not_displayed = self.wait_for_invisibility(
+                By.CSS_SELECTOR,
+                ".njg-tooltip-inner",
+            )
+            self.assertTrue(popup_not_displayed)
+            self.web_driver.close()
+            self.web_driver.switch_to.window(tabs[0])
+
+        # Cleanup in case of failure to ensure the it does not end up with multiple tabs open
+        if len(self.web_driver.window_handles) > 1:
+            primary_tab = self.web_driver.window_handles[0]
+            for tab in self.web_driver.window_handles[1:]:
+                self.web_driver.switch_to.window(tab)
+                self.web_driver.close()
+            self.web_driver.switch_to.window(primary_tab)

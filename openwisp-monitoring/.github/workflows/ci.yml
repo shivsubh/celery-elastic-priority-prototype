@@ -1,0 +1,151 @@
+---
+name: OpenWISP Monitoring CI Build
+
+on:
+  push:
+    branches:
+      - master
+      - dev
+      - "1.2"
+  pull_request:
+    branches:
+      - master
+      - dev
+      - "1.2"
+      - gsoc25-map
+
+jobs:
+  build:
+    name: Python==${{ matrix.python-version }} | ${{ matrix.django-version }}
+    runs-on: ubuntu-24.04
+
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+        django-version:
+          - django~=4.2.0
+          - django~=5.1.0
+          - django~=5.2.0
+        exclude:
+          # Python 3.13 supported only in Django >=5.1.3
+          - python-version: "3.13"
+            django-version: django~=4.2.0
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Cache APT packages
+        uses: actions/cache@v5
+        with:
+          path: /var/cache/apt/archives
+          key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
+          restore-keys: |
+            apt-${{ runner.os }}-
+
+      - name: Disable man page auto-update
+        run: |
+          echo 'set man-db/auto-update false' | sudo debconf-communicate >/dev/null
+          sudo dpkg-reconfigure man-db
+
+      - name: Set up and Cache Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+          cache-dependency-path: |
+            **/requirements*.txt
+
+      - name: Install Dependencies
+        id: deps
+        run: |
+          sudo apt update -qq
+          sudo apt -qq install \
+            sqlite3 \
+            fping \
+            gdal-bin \
+            libproj-dev \
+            libgeos-dev \
+            libspatialite-dev \
+            spatialite-bin \
+            libsqlite3-mod-spatialite
+          pip install -U pip wheel setuptools
+          pip install -r requirements-test.txt
+          pip install -U -I -e .
+          pip install -U ${{ matrix.django-version }}
+          sudo npm install -g prettier
+
+      - name: Start InfluxDB
+        if: ${{ !cancelled() && steps.deps.conclusion == 'success' }}
+        run: docker compose up -d influxdb
+
+      - name: QA checks
+        run: |
+          ./run-qa-checks
+
+      - name: Tests
+        if: ${{ !cancelled() && steps.deps.conclusion == 'success' }}
+        run: |
+          ./runtests
+        env:
+          SELENIUM_HEADLESS: 1
+          GECKO_LOG: 1
+
+      - name: Show gecko web driver log on failures
+        if: ${{ failure() }}
+        run: cat geckodriver.log
+
+      - name: Upload Coverage
+        if: ${{ success() }}
+        uses: coverallsapp/github-action@v2
+        with:
+          parallel: true
+          format: cobertura
+          flag-name: python-${{ matrix.python-version }}-${{ matrix.django-version }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          fail-on-error: false
+
+  deploy:
+    name: Deploy Docker Image
+    runs-on: ubuntu-24.04
+    needs:
+      - build
+
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' }}
+    steps:
+      - uses: actions/checkout@master
+
+      # the following action is equivalent to
+      # echo "$DOCKER_HUB_SECRET" | docker login --username "$DOCKER_HUB_USERNAME" --password-stdin
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_SECRET }}
+
+      - name: Push to Docker
+        run: |
+          docker build . -t openwisp/openwisp-monitoring:develop
+          docker push openwisp/openwisp-monitoring:develop
+
+  coveralls:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Coveralls Finished
+        uses: coverallsapp/github-action@v2
+        with:
+          parallel-finished: true
+          fail-on-error: false

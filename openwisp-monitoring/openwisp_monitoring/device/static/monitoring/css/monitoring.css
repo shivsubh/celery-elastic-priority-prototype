@@ -1,0 +1,148 @@
+#ow-device-status > fieldset > .inline-related {
+  padding: 0 1px;
+}
+#ow-device-status h2 {
+  color: #333;
+  background-color: rgba(0, 0, 0, 0.05);
+  outline: 1px solid rgba(0, 0, 0, 0.3);
+  padding: 15px;
+}
+#ow-device-status .form-row,
+#ow-device-status table th,
+#ow-device-status table td {
+  padding: 15px 20px !important;
+}
+#ow-device-status .form-row label,
+#ow-device-status .form-row div,
+#ow-device-status table td,
+#ow-device-status table th {
+  font-size: 15px !important;
+}
+#ow-device-status .form-row label {
+  padding-top: 2px;
+}
+#ow-device-status .inline-group {
+  margin-bottom: 0;
+  padding-top: 1px;
+}
+#ow-device-status table {
+  width: 100%;
+  margin: 0;
+}
+#ow-device-status th {
+  border-top: 0 none;
+  background: #f9f9f9 !important;
+}
+td.field-health_status,
+.field-health_status .readonly {
+  font-weight: bold;
+  text-transform: uppercase;
+}
+.health-deactivated {
+  color: #000;
+}
+.health-unknown {
+  color: grey;
+}
+.health-ok {
+  color: green;
+}
+.health-problem {
+  color: orange;
+}
+.health-critical {
+  color: red;
+}
+#ow-device-status table.addresses td {
+  width: 50%;
+}
+.wifi-clients th.ht,
+.wifi-clients th.vht,
+.wifi-clients th.wmm,
+.wifi-clients th.wds,
+.wifi-clients th.wps {
+  cursor: default;
+}
+/* Adjustments for django-nested-admin */
+#monitoring-metric-content_type-object_id-group
+  .djn-group-nested
+  fieldset.djn-fieldset.module
+  > h2,
+#monitoring-metric-content_type-object_id-group
+  .djn-group-nested
+  fieldset.djn-fieldset.module
+  .djn-inline-form
+  > h3 {
+  display: none;
+}
+#monitoring-metric-content_type-object_id-group {
+  padding-top: 0 !important;
+}
+#monitoring-metric-content_type-object_id-group fieldset .form-row:last-child {
+  border-bottom: 0 none;
+}
+#monitoring-metric-content_type-object_id-0 h3 {
+  border-top: 0 none !important;
+}
+.form-row.field-health_checks div.readonly {
+  margin-left: 0px !important;
+}
+.form-row.field-health_checks div div.flex-container div.readonly ul.health_checks {
+  margin-left: 0px !important;
+  padding-left: 0px !important;
+}
+.djn-module .vCheckboxLabel {
+  line-height: 24px;
+  padding-left: 8px;
+  min-width: 140px;
+  width: auto;
+}
+.djn-module .flex-container {
+  flex-wrap: wrap;
+}
+.djn-module .help {
+  width: 100%;
+}
+.djn-module .field-is_active .help {
+  margin-left: 0 !important;
+  width: auto;
+}
+#main #content-main .djn-module summary {
+  background: var(--ow-color-fg-ghost);
+}
+#main #content-main .djn-module details[open] {
+  border: 1px solid var(--hairline-color);
+}
+#main #content-main .djn-module summary h4 {
+  padding: 0 0 0 5px;
+  text-transform: capitalize;
+  font-size: 14px;
+  border: 0 none;
+}
+#main #content-main .djn-module details .form-row:last-child {
+  border-bottom: 1px solid var(--hairline-color);
+}
+.field-custom_threshold input[type="number"] {
+  width: 5em;
+}
+/* Active monitoring tabs color adjustment */
+ul.tabs .charts > .current,
+ul.tabs .status > .current {
+  background-color: var(--body-bg);
+}
+
+/* Device Location Inline */
+fieldset.module.aligned .form-row.view-on-map-div {
+  display: block;
+}
+fieldset.module .view-on-map-btn {
+  color: white;
+  text-decoration: none !important;
+}
+
+/* Map Page */
+.dedicated-map-page {
+  width: 100%;
+  height: calc(100vh - 126px) !important;
+  margin: 15px auto 0 auto !important;
+}
